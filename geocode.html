@@ -1,0 +1,276 @@
+<!-- Copyright (C) 2017 Google Inc.
+  -
+  - Licensed under the Apache License, Version 2.0 (the "License");
+  - you may not use this file except in compliance with the License.
+  - You may obtain a copy of the License at
+  -
+  -      http://www.apache.org/licenses/LICENSE-2.0
+  -
+  - Unless required by applicable law or agreed to in writing, software
+  - distributed under the License is distributed on an "AS IS" BASIS,
+  - WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  - See the License for the specific language governing permissions and
+  - limitations under the License.
+
+  This is not an official Google product.
+ -->
+<html>
+<head>
+<title> Geocoder</title>
+
+</head>
+<style>
+body { font-family: arial };
+</style>
+<body>
+  <script type='text/javascript'>
+     // Addres creation vars
+     var accuracy_dict = {'ROOFTOP' : 4, 'RANGE_INTERPOLATED' : 3, 'GEOMETRIC_CENTER' : 2, 'APPROXIMATE' : 1}
+     var addr_list = ['street_number', 'route', 'locality', 'administrative_area_level_1', 'postal_code']
+     var normal_ending_list = [' ', ', ', ', ', ' ', ' ', '']; // Ignored, but can be used for normal address
+     var separate_ending_list = [' ', ',', ',', ',', ','];
+
+     // Constants
+     var url = "https://maps.googleapis.com/maps/api/geocode/json?";
+     var city_reg = new RegExp(', ([^\\,0-9]* [A-Za-z]{2})\\b'); // Regex to look for city, state
+
+     // DOM elements (repeated access) - set on process
+     var processing_div;  // div that prints the processing.
+     var output_area;     // output textarea div
+     
+     // Key storage
+     var key = "";  // API key to use when processing
+
+     // State
+     var processing = false;  // True if we are processing a set.
+     var addresses = []; // addresses from the first text box on process
+     var output_addresses = [];  // Result strings
+     var cancel = 0;  // remaining items to cancel, or 0 to not cancel
+     var next_printed_output = 0;  // Shows the next output that's unprinted.
+     var parallelism = 5; // How many requests to execute at once.
+     var cancel_error = ""; // If we cancel due to error, it's here.
+     var show_original_address = false;  // Show original addresses
+
+     
+     // Inital call into the processing. doAddress will call process the next
+     // address after processing the first one.
+     codeAddress = function() {
+      if (processing) return;
+      processing = true;
+      processing_div = document.getElementById("processing");
+      next_printed_output = 0;
+      key = document.getElementById("apikey").value;
+      show_original_address = document.getElementById("original_address").checked;
+      cancel = 0;
+      cancel_error = "";
+
+      if (key === "") {
+        parallelism = 1;  // No key means 10 req/sec.
+      }
+
+      addresses = document.getElementById("first").value.split("\n");
+      output_addresses = []
+      for (var i = 0; i < addresses.length; i++) {
+        output_addresses.push(null); // Initialize
+      }
+      output_area = document.getElementById("second");
+      output_area.value = ((show_original_address) ? "Original Address, " : "") +"Street, City, State, Zip, Lat, Long, Accuracy\n";
+      for (var i = 0; i < Math.min(parallelism, addresses.length); i++) {
+        doAddress(0, i);
+      }
+    }
+
+    // Called when user clicks cancel.
+    doCancel = function() {
+      if (processing && cancel == 0) {
+        cancel = parallelism;
+      }
+    }
+
+    // Add the given string to the output addresses at the given index. Also
+    // prints what we have so far of the output.
+    outputAddress = function(addr_string, number) {
+      output_addresses[number] = addr_string;
+      while (output_addresses[next_printed_output] != null &&
+             next_printed_output < addresses.length) {
+        output_area.value += output_addresses[next_printed_output];
+        output_addresses[next_printed_output] = null;
+        addresses[next_printed_output] = null;
+        next_printed_output++;
+      }
+      processing_div.innerHTML = "Processing " +
+                                 String("    " + (next_printed_output)).slice(-5) +
+                                 " / " + addresses.length;
+
+      if (next_printed_output == addresses.length) {
+        // Signal we are completely done.
+        finish("<font color=green>Done! Processed " + addresses.length + " lines!</font>");
+        return;
+      }
+    }
+
+    // Called when we stop processing due to cancel, completion, or error.
+    // end_str is printed above the output.
+    finish = function(end_str) {
+      cancel = 0;
+      processing_div.innerHTML = end_str;
+      output_addresses = []
+      addresses = []
+      processing = false;
+      return;
+    }
+
+    printEmptyAddress = function(number) {
+      var old_addr = (show_original_address) ? '"' + addresses[number] +'",' : "";
+      outputAddress(old_addr +'N/A, N/A, N/A, N/A, 0, 0, 0 \n', number);
+    }
+
+    // Result is a json response from the API. number is the index this
+    // address is in the output.
+    printAddress = function(result, number) {
+      var geometry = result.results[0].geometry;
+      var location = geometry.location;
+      var loc_type = geometry.location_type;
+      
+      var new_addrs = result.results[0].address_components;
+      var addr_dict = {}
+      for (var i = 0; i < new_addrs.length; i++) {
+        var addr = new_addrs[i];
+        addr_dict[addr.types[0]] = addr.short_name;
+      }
+
+      if (addr_dict['country'] === "US") {
+        addr_dict['country'] = 'USA';
+      }
+
+      var new_addr = ""
+      for (var i = 0; i < addr_list.length; i++) {
+        var res = addr_dict[addr_list[i]];
+        new_addr += ((res != undefined) ? res : "") + separate_ending_list[i];
+      }
+      var orig = (show_original_address) ? ('"' + addresses[number] + '",')  : "";
+      outputAddress(orig + new_addr + location.lat + ', ' + location.lng +
+                    ', ' + accuracy_dict[loc_type] +'\n', number);
+    }
+
+    // Makes the request and on callback processes. Will call doAddress with an incremented
+    // retry or an incremented number. Increments the number by the given parallelism. One
+    // chain will do number = k, parallelism*k, 2*parallelism*k, etc.
+    // Must call OutputAddress for every addres it processes even if it fails.
+    doAddress = function(retry, number, just_city=false) {
+      // Check for a cancel.
+      if (cancel > 0) {
+        cancel--;  // one 'thread' stopped
+        if (cancel == 0) {
+          if (cancel_error === "") {
+            cancel_error = "Done!. Cancelled..";
+          }
+          finish(cancel_error);
+        }
+        return;
+      } 
+      if (number >= addresses.length) {
+        return;
+      }
+      
+      // If we've retried 3 times, die.
+      if (retry >= 3) {
+        cancel = Math.min(parallelism, addresses.length) - 1;  // Set to cancel.
+        cancel_error = "Issues contacting google. Giving up. Try again later.";
+        return;
+      }
+
+      // Skip this one if it's blank.
+      if (addresses[number] == "") {
+        outputAddress("", number);
+        doAddress(0, number + parallelism);
+        return;
+      }
+
+      var addr = addresses[number];
+
+      // If just_city, attempt to parse out the city. If you can't
+      // find it, then just do the next one.
+      if (just_city) {
+        var result = city_reg.exec(addresses[number]);
+        if (result == null) {
+          // No match, give up.
+          console.log('no match');
+          printEmptyAddress(number);
+          doAddress(0, number + parallelism);
+          return;
+        }
+        console.log('Attempting with address' + addr);
+        addr = result[1];
+      }
+
+      // Generate the request.
+      var local_url = url + "address=" + encodeURIComponent(addr);
+      if (key != "") {
+        local_url = local_url + "&key=" + encodeURIComponent(key);
+      }
+      
+      // Request
+      var xhr = new XMLHttpRequest();
+      xhr.open("GET", local_url, true);
+      xhr.onreadystatechange = function (e) {
+       if (this.readyState !== 4) {
+        return;
+      }
+
+      if (this.status === 200) {  // Connected to Google
+        var result = JSON.parse(xhr.responseText);
+        if (result.status === "OK") {
+          printAddress(result, number);
+          doAddress(0, number + parallelism); // Do next one.
+          return; // Processed!
+        }
+        // JSON result from google failed.
+        if (result.status === "ZERO_RESULTS") { 
+          if (just_city) {
+            // We really found nothing.
+            printEmptyAddress(number);
+            doAddress(0, number + parallelism);
+            return;
+          } else {
+            // Attempt to parse out address and try with just city.
+            doAddress(retry, number, true);  // Try again with just_city
+            return;
+          }
+        }
+        if (result.status === "OVER_QUERY_LIMIT") {
+          console.log("Waiting for " +parallelism+ "s for query limit.");
+          setTimeout(function() { doAddress(retry + 1, number) }, 1000 * parallelism);
+          return;
+        }
+        // Other Google error.
+        console.log(result.status);
+        doAddress(retry + 1, number);
+        return;
+      } else {
+        // Error connecting to Google
+        console.error(this.statusText);
+        doAddress(retry + 1, number);
+        return;
+      }
+    };  
+    xhr.send();
+  }
+
+
+
+</script>
+<center><span style="font-size:30px"> Geocoder </span></center> <br>This site is used to geocode addresses for use in mapping applications.  For best results, a Google API key is required. See details below.
+<br><br>
+Using a Google API:  <br>
+Processing with or without an API key allows 2500 addresses to be processed per day for free.  However processing with an API key is faster.  When billing is enabled on the key, the 2500 addresses per day limit can be exceeded.  The cost for addresses over 2500/day is 50 cents/1000 addresses and is charged automatically to your Google account.<br><a href="https://console.developers.google.com/apis/api/geocoding_backend/usage" target="_blank">View Usage</a>. <a href="https://developers.google.com/maps/documentation/geocoding/get-api-key" target="_blank">Get a Google API key.</a><br><br><br>
+Api Key: <input type="textbox" size="50" id="apikey"> <span id="keyspan"></span><br>
+<input type="checkbox" id="original_address" value="check"> Show Original Addresses<br><br>
+<input type="button" value="Geocode Addresses" onclick="codeAddress()">  <input type="button" value="Cancel" onclick="doCancel()">
+<div id="processing"></div>
+<br>
+<textarea id="first" rows="40" cols="35" placeholder="Address1                                                Address2                                                        etc..."></textarea>
+<textarea id="second" rows="40" cols="65" placeholder="Output appears here when you click &#39;Geocode&#39;."></textarea>
+
+</body>
+</html>
